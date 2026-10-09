@@ -27,8 +27,10 @@ final class Assets
     /** @var list<class-string> */
     private const array CORE_SEEDS = [
         \App\App::class,
-        Flames\Kernel\Client\Error::class,
-        Flames\Kernel\Client::class,
+        \Flames\Surface\Runtime\Error::class,
+        \Flames\Surface\Runtime\KernelClient::class,
+        \Flames\Surface\Runtime\Virtual::class,
+        \Flames\Surface\Runtime\AutoLoad::class,
         Flames\Connection\Client::class,
         Flames\Collection\Strings::class,
         Flames\Collection\Bools::class,
@@ -62,17 +64,17 @@ final class Assets
         Flames\Event\Element\KeyDown::class,
         Flames\Event\Element\KeyUp::class,
         Flames\Event\Element\Focus::class,
-        Flames\Kernel\Client\Dispatch::class,
+        \Flames\Surface\Runtime\Dispatch::class,
         Flames\Js\Module::class,
         Flames\Client\Os::class,
         Flames\Client\Platform::class,
         Flames\Client\Browser::class,
         Flames\Client\UserAgentParser::class,
-        Flames\Kernel\Client\Dispatch\Tag::class,
+        \Flames\Surface\Runtime\Dispatch\Tag::class,
         Flames\Client\Tag::class,
         Flames\Element\Shadow::class,
-        Flames\Kernel\Client\Service\Keyboard::class,
-        Flames\Kernel\Client\Service\Clipboard::class,
+        \Flames\Surface\Runtime\Service\Keyboard::class,
+        \Flames\Surface\Runtime\Service\Clipboard::class,
         Flames\Client\Keyboard::class,
         Flames\Client\Keyboard\Event::class,
         Flames\Client\Clipboard::class,
@@ -83,13 +85,25 @@ final class Assets
         Flames\Cookie\Client::class,
         Flames\Date\DateTime::class,
         Flames\Date\TimeZone\Client::class,
-        Flames\Kernel\Client\Dispatch\Native::class,
+        \Flames\Surface\Runtime\Dispatch\Native::class,
         Flames\Client\Native::class,
         Flames\Client\Browser\DevTools::class,
         Flames\Client\Shell::class,
         Flames\Event\Native\Shell::class,
         Flames\Env\Env::class,
         Flames\Ready\ResetData::class,
+    ];
+
+    /** Classes that must be eval'd in order before the WASM autorun (needs Js + Virtual + AutoLoad). */
+    /** @var list<class-string> */
+    private const array AUTORUN_BOOTSTRAP_SEEDS = [
+        \App\App::class,
+        Flames\Js\Window::class,
+        \Flames\Surface\Surface\Js\Bridge::class,
+        Flames\Js::class,
+        \Flames\Surface\Runtime\Error::class,
+        \Flames\Surface\Runtime\Virtual::class,
+        \Flames\Surface\Runtime\AutoLoad::class,
     ];
 
     /** @var list<class-string> */
@@ -113,10 +127,8 @@ final class Assets
     /** @var array<class-string, list<class-string>> */
     private array $dependencyMap = [];
 
-    public function __construct(
-        mixed $data,
-        private readonly bool $legacyEngine = false,
-    ) {
+    public function __construct(mixed $data)
+    {
         $this->auto = (bool)($data->option->contains('auto') ?? false);
     }
 
@@ -183,7 +195,7 @@ final class Assets
     private function injectStructure(mixed $stream): void
     {
         if ($this->debug) {
-            echo "Inject structure javascript system\n";
+            echo "Inject Surface bootstrap\n";
         }
 
         $this->swfExtension     = false;
@@ -195,50 +207,8 @@ final class Assets
             $this->swfExtension     = in_array('swf', $this->clientExtensions, true);
         }
 
-        if (!$this->legacyEngine) {
-            $this->writeSurfaceBootstrap($stream);
-            fwrite($stream, 'Flames.Surface.onLoad=async function(){');
-            return;
-        }
-
-        $dateTimezone = trim((string)(Env::get('DATE_TIMEZONE') ?? ''));
-        if ($dateTimezone === '') {
-            $dateTimezone = 'UTC';
-        }
-
-        $appNativeKey = (string)\Flames\Forge\Cli\Command\Build\App\Native::getAppNativeKey();
-        $unsupportedPath = APP_PATH . 'Client/Resource/Event/Unsupported.js';
-        if (!is_file($unsupportedPath)) {
-            $unsupportedPath = APP_PATH . 'Resource/Event/Unsupported.js';
-        }
-        $unsupported = (string)@file_get_contents($unsupportedPath);
-
-        $engine = str_replace(
-            [
-                '{{ environment }}',
-                '{{ dumpLocalPath }}',
-                '{{ dateTimeZone }}',
-                '\'{{ asyncRedirect }}\'',
-                '\'{{ swfExtension }}\'',
-                '\'{{ composer }}\'',
-                '\'{{ unsupported }}\';',
-                '{{ appNativeKey }}',
-            ],
-            [
-                rawurlencode((string)Env::get('ENVIRONMENT')),
-                rawurlencode((string)Env::get('DUMP_LOCAL_PATH')),
-                rawurlencode($dateTimezone),
-                Env::get('CLIENT_ASYNC_REDIRECT') === true ? 'true' : 'false',
-                $this->swfExtension ? 'true' : 'false',
-                FLAMES_COMPOSER === true ? 'true' : 'false',
-                '(function(){' . $unsupported . '})();',
-                $appNativeKey,
-            ],
-            (string)file_get_contents(FLAMES_PATH . 'framework/Flames/(deprecated)/Kernel/Client/Engine/Flames.js')
-        );
-
-        fwrite($stream, $engine);
-        fwrite($stream, 'window.Flames.onReady=function(){');
+        $this->writeSurfaceBootstrap($stream);
+        fwrite($stream, 'Flames.Surface.onLoad=async function(){');
     }
 
     /** @param resource $stream */
@@ -307,7 +277,7 @@ final class Assets
 
         $relative = substr(str_replace('\\', '/', $class), 7) . '.php';
         $deprecated = FLAMES_PATH . 'framework/Flames/(deprecated)/' . $relative;
-        if (is_file($deprecated)) {
+        if (is_file($deprecated) && !str_starts_with($class, 'Flames\\Kernel\\Client\\')) {
             return $deprecated;
         }
 
@@ -377,89 +347,48 @@ final class Assets
     /** @param resource $stream */
     private function injectDefaultFiles(mixed $stream): void
     {
-        $virtual = $this->loadClassPhp(Flames\Kernel\Client\Virtual::class)
-                 . $this->loadOptionalClassPhp(Flames\Dump\Client::class);
+        /** @var array<string, string> $buffers */
+        $buffers = [];
 
-        $virtualFilesBuffer        = '';
-        $virtualFilesBuffer        = $this->mountVirtualDefaultFiles($virtualFilesBuffer);
-        $clientFilesBufferMetadata = $this->mountVirtualClientFilesMetadata($virtualFilesBuffer);
-        $virtualFilesBuffer        = $clientFilesBufferMetadata['virtualFilesBuffer'];
+        $this->mountVirtualDefaultFiles($buffers);
+        $this->appendOptionalRuntimeClass($buffers, \Flames\Dump\Client::class);
+        $clientMetadata = $this->mountVirtualClientFilesMetadata($buffers);
 
-        fwrite($stream, 'window.Flames.Internal.eventTriggers = Flames.Internal.unserialize(atob(\''
-            . base64_encode(serialize($clientFilesBufferMetadata['events']->toArray()))
-            . '\'));');
-
-        fwrite($stream, 'window.Flames.Internal.publicEnv=Flames.Internal.unserialize(atob(\''
-            . base64_encode(serialize(PublicEnv::collect()))
-            . '\'));');
-
-        $virtualConstructsBuffer = 'private static $constructors = [';
-        foreach ($clientFilesBufferMetadata['staticConstructors'] as $constructor) {
-            $virtualConstructsBuffer .= "'{$constructor}',";
+        $tagsMap = [];
+        foreach ($clientMetadata->tags as $tag) {
+            $tagsMap[$tag->uid] = $tag->class;
         }
 
-        $virtualTagsBuffer = 'private static $tags = [';
-        foreach ($clientFilesBufferMetadata['tags'] as $tag) {
-            $virtualTagsBuffer .= "'{$tag->uid}' => '{$tag->class}',";
-        }
-
-        $virtualViewsBuffer = 'private static $views = [';
+        $viewsMap = [];
         if (Assets\Mesh::isMeshExtension()) {
-            foreach ($clientFilesBufferMetadata['views'] as $viewNs => $viewData) {
-                $virtualViewsBuffer .= "'{$viewNs}' => '" . base64_encode($viewData) . "',";
+            foreach ($clientMetadata->views as $viewNs => $viewData) {
+                $viewsMap[$viewNs] = base64_encode((string) $viewData);
             }
         }
 
-        $virtualFilesBuffer        = 'private static $buffers = [' . $virtualFilesBuffer;
-        $virtualDependenciesBuffer = 'private static $dependencies = [' . $this->buildVirtualDependenciesBuffer();
-        $virtual = str_replace(
-            [
-                'private static $buffers = [',
-                'private static $dependencies = [',
-                'private static $constructors = [',
-                'private static $tags = [',
-                'private static $views = [',
-            ],
-            [
-                $virtualFilesBuffer,
-                $virtualDependenciesBuffer,
-                $virtualConstructsBuffer,
-                $virtualTagsBuffer,
-                $virtualViewsBuffer,
-            ],
-            $virtual
-        );
+        $bootstrapChain = $this->buildBootstrapChain();
+        $bootScriptB64  = base64_encode($this->buildWasmBootScript($buffers, $bootstrapChain));
 
-        $autoLoadSource = $this->loadOptionalClassPhp(Flames\AutoLoad\Client::class);
-        if ($autoLoadSource !== '') {
-            $virtual .= $this->parseMockFile(
-                Flames\AutoLoad\Client::class,
-                $autoLoadSource
-            );
-        }
-        fwrite($stream, $this->jsEvalBase64(base64_encode($virtual)));
+        $manifest = [
+            'buffers'      => $buffers,
+            'dependencies' => $this->buildDependenciesArray(),
+            'constructors' => $clientMetadata->staticConstructors->toArray(),
+            'tags'         => $tagsMap,
+            'views'        => $viewsMap,
+            'events'       => $clientMetadata->events->toArray(),
+            'publicEnv'    => PublicEnv::collect(),
+        ];
 
-        $autorun = '';
-        if ($autoLoadSource !== '') {
-            $autorun .= '\Flames\AutoLoad::run();';
-        }
-        $autorun .= '
-        if(!defined("MODULE")){define("MODULE","CLIENT");}
-        function Arr(mixed $value=null):\Flames\Collection\Arr{if($value instanceof \Flames\Collection\Arr){return $value;}return new \Flames\Collection\Arr($value);}
-        function once(\Closure $delegate):mixed{return \Flames\Collection\Functions::once($delegate);}
-        if(isset(\Flames\Js::getWindow()->Flames->Internal->publicEnv)){\Flames\Ready\ResetData::$data[".env"]=(array)\Flames\Js::getWindow()->Flames->Internal->publicEnv;\Flames\Ready\ResetData::$data[".env.public"]=array_fill_keys(array_keys(\Flames\Ready\ResetData::$data[".env"]),true);}
-        $tz=\Flames\Js::getWindow()->Flames->Internal->publicEnv["DATE_TIMEZONE"]??null;
-        if(is_string($tz)&&$tz!==""){\Flames\Js::getWindow()->Flames->Internal->dateTimeZone=$tz;}
-        \Flames\Kernel\Client\Dispatch::run();
-';
-        $evalAutorun = "Flames.Internal.evalBase64('" . base64_encode($autorun) . "')";
-        if (!$this->legacyEngine) {
-            fwrite($stream, 'await ' . $evalAutorun . ';');
-        } else {
-            fwrite($stream, 'var data=' . $evalAutorun . ';if (data!==null){dump(data);}');
+        $payloadJson = json_encode($manifest, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($payloadJson === false) {
+            throw new \RuntimeException('Failed to encode Surface payload manifest.');
         }
 
-        foreach ($clientFilesBufferMetadata->tags as $tag) {
+        $this->writeSurfaceBootScript($stream, base64_encode($payloadJson), $bootScriptB64);
+
+        fwrite($stream, 'await Flames.Surface.boot();');
+
+        foreach ($clientMetadata->tags as $tag) {
             fwrite($stream, "window.eval(atob('" . base64_encode($tag->eval) . "'));");
         }
 
@@ -467,7 +396,118 @@ final class Assets
         fwrite($stream, '};');
     }
 
-    private function mountVirtualDefaultFiles(string $virtualFilesBuffer): string
+    /**
+     * @return array<string, list<string>>
+     */
+    private function buildDependenciesArray(): array
+    {
+        $map = [];
+
+        foreach ($this->dependencyMap as $class => $dependencies) {
+            if ($dependencies === [] || !$this->isBundleClassName($class)) {
+                continue;
+            }
+
+            $deps = array_values(array_unique(array_filter(
+                $dependencies,
+                $this->isBundleClassName(...),
+            )));
+
+            if ($deps !== []) {
+                $map[$class] = $deps;
+            }
+        }
+
+        return $map;
+    }
+
+    /**
+     * Classes that must exist before the WASM autorun executes (hash + fqcn for idempotent eval).
+     *
+     * @return list<array{hash: string, class: string}>
+     */
+    private function buildBootstrapChain(): array
+    {
+        $resolver = new Assets\Dependencies(fn (string $class): ?string => $this->resolveClassFile($class));
+        $order    = $resolver->resolve(self::AUTORUN_BOOTSTRAP_SEEDS);
+        $chain    = [];
+        $seen     = [];
+
+        foreach ($order as $class) {
+            if (!$this->isBundleClassName($class)) {
+                continue;
+            }
+
+            $hash = sha1($class);
+            if (isset($seen[$hash])) {
+                continue;
+            }
+
+            $seen[$hash] = true;
+            $chain[]     = ['hash' => $hash, 'class' => $class];
+        }
+
+        return $chain;
+    }
+
+    /**
+     * Single php-wasm script: bootstrap seeds + Virtual hydrate + Dispatch (one php.run()).
+     *
+     * @param array<string, string>              $buffers
+     * @param list<array{hash: string, class: string}> $bootstrapChain
+     */
+    private function buildWasmBootScript(array $buffers, array $bootstrapChain): string
+    {
+        $php = "if(!defined('MODULE')){define('MODULE','CLIENT');}\n";
+
+        foreach ($bootstrapChain as $entry) {
+            $class  = $entry['class'];
+            $source = $buffers[$entry['hash']] ?? '';
+            if ($source === '') {
+                continue;
+            }
+
+            // Namespace declarations must not sit inside if-blocks; eval() parses each unit separately.
+            $php .= 'if(!class_exists(' . var_export($class, true) . ',false)';
+            $php .= '&&!interface_exists(' . var_export($class, true) . ',false)';
+            $php .= '&&!trait_exists(' . var_export($class, true) . ',false)){';
+            $php .= 'eval(' . var_export(trim($source), true) . ');';
+            $php .= "}\n";
+        }
+
+        $php .= <<<'PHP'
+$payload = \Flames\Js::getWindow()->Flames->Internal->payload;
+\Flames\Surface\Runtime\Virtual::bootstrap($payload);
+\Flames\Surface\Runtime\AutoLoad::run();
+function Arr(mixed $value=null):\Flames\Collection\Arr{if($value instanceof \Flames\Collection\Arr){return $value;}return new \Flames\Collection\Arr($value);}
+function once(\Closure $delegate):mixed{return \Flames\Collection\Functions::once($delegate);}
+if(isset(\Flames\Js::getWindow()->Flames->Internal->publicEnv)){\Flames\Ready\ResetData::$data[".env"]=(array)\Flames\Js::getWindow()->Flames->Internal->publicEnv;\Flames\Ready\ResetData::$data[".env.public"]=array_fill_keys(array_keys(\Flames\Ready\ResetData::$data[".env"]),true);}
+\Flames\Surface\Runtime\Dispatch::run();
+
+PHP;
+
+        return $php;
+    }
+
+    /** @param resource $stream */
+    private function writeSurfaceBootScript(mixed $stream, string $payloadB64, string $bootScriptB64): void
+    {
+        fwrite($stream, 'Flames.Surface._payloadB64="' . $payloadB64 . '";');
+        fwrite($stream, 'Flames.Surface._bootScriptB64="' . $bootScriptB64 . '";');
+        fwrite($stream, 'Flames.Surface.boot=async function(){');
+        fwrite($stream, 'var manifest=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(Flames.Surface._payloadB64),function(c){return c.charCodeAt(0);})));');
+        fwrite($stream, 'window.Flames.Internal.payload=manifest;');
+        fwrite($stream, 'window.Flames.Internal.eventTriggers=manifest.events||[];');
+        fwrite($stream, 'window.Flames.Internal.publicEnv=manifest.publicEnv||{};');
+        fwrite($stream, 'var tz=manifest.publicEnv&&manifest.publicEnv.DATE_TIMEZONE;');
+        fwrite($stream, 'if(typeof tz==="string"&&tz!==""){window.Flames.Internal.dateTimeZone=tz;}');
+        fwrite($stream, 'await Flames.Internal.evalBase64(Flames.Surface._bootScriptB64);};');
+    }
+
+    /**
+     * @param array<string, string> $buffers
+     */
+    private function mountVirtualDefaultFiles(array &$buffers): void
     {
         $resolver = new Assets\Dependencies(fn (string $class): ?string => $this->resolveClassFile($class));
         $seeds    = $this->collectRuntimeSeeds();
@@ -487,21 +527,19 @@ final class Assets
                 continue;
             }
 
-            $virtualFilesBuffer = $this->appendVirtualClassBuffer(
-                $virtualFilesBuffer,
+            $this->appendVirtualClassBuffer(
+                $buffers,
                 $defaultFile,
                 $clientMocksSet,
                 $buffered,
             );
         }
 
-        $virtualFilesBuffer = $this->ensureDependencyBuffers(
-            $virtualFilesBuffer,
+        $this->ensureDependencyBuffers(
+            $buffers,
             $clientMocksSet,
             $buffered,
         );
-
-        return $virtualFilesBuffer;
     }
 
     /**
@@ -526,20 +564,19 @@ final class Assets
     }
 
     /**
+     * @param array<string, string>    $buffers
      * @param array<class-string, int> $clientMocksSet
-     */
-    /**
-     * @param array<string, true> $buffered
+     * @param array<string, true>      $buffered
      */
     private function appendVirtualClassBuffer(
-        string $virtualFilesBuffer,
+        array &$buffers,
         string $defaultFile,
         array $clientMocksSet,
         array &$buffered = [],
-    ): string {
+    ): void {
         $bufferKey = $this->virtualBufferKey($defaultFile, $clientMocksSet);
         if (isset($buffered[$bufferKey])) {
-            return $virtualFilesBuffer;
+            return;
         }
 
         $path = $this->resolveClassFile($defaultFile);
@@ -548,7 +585,7 @@ final class Assets
                 echo 'Skip missing runtime class ' . $defaultFile . "\n";
             }
 
-            return $virtualFilesBuffer;
+            return;
         }
 
         $phpFile = $this->loadPhpFile($path);
@@ -565,36 +602,34 @@ final class Assets
             echo 'Compile ' . $defaultFile . ".php\n";
         }
 
-        $buffered[$bufferKey] = true;
-
-        return $virtualFilesBuffer . "'" . sha1($bufferKey) . "'=>'" . base64_encode($phpFile) . "',";
+        $buffered[$bufferKey]   = true;
+        $buffers[sha1($bufferKey)] = $phpFile;
     }
 
     /**
+     * @param array<string, string>    $buffers
      * @param array<class-string, int> $clientMocksSet
      * @param array<string, true>      $buffered
      */
     private function ensureDependencyBuffers(
-        string $virtualFilesBuffer,
+        array &$buffers,
         array $clientMocksSet,
         array &$buffered,
-    ): string {
+    ): void {
         foreach ($this->dependencyMap as $dependencies) {
             foreach ($dependencies as $dependency) {
                 if (!$this->isBundleClassName($dependency)) {
                     continue;
                 }
 
-                $virtualFilesBuffer = $this->appendVirtualClassBuffer(
-                    $virtualFilesBuffer,
+                $this->appendVirtualClassBuffer(
+                    $buffers,
                     $dependency,
                     $clientMocksSet,
                     $buffered,
                 );
             }
         }
-
-        return $virtualFilesBuffer;
     }
 
     /**
@@ -611,35 +646,6 @@ final class Assets
         return implode('\\', array_slice($split, 0, count($split) - 1));
     }
 
-    private function buildVirtualDependenciesBuffer(): string
-    {
-        $buffer = '';
-
-        foreach ($this->dependencyMap as $class => $dependencies) {
-            if ($dependencies === [] || !$this->isBundleClassName($class)) {
-                continue;
-            }
-
-            $deps = array_values(array_unique(array_filter(
-                $dependencies,
-                $this->isBundleClassName(...),
-            )));
-
-            if ($deps === []) {
-                continue;
-            }
-
-            $encodedDeps = array_map(
-                static fn (string $dep): string => var_export($dep, true),
-                $deps,
-            );
-
-            $buffer .= var_export($class, true) . '=>[' . implode(',', $encodedDeps) . '],';
-        }
-
-        return $buffer;
-    }
-
     private function isBundleClassName(string $class): bool
     {
         return (bool) preg_match('/^(Flames|App)(\\\\[A-Za-z_][A-Za-z0-9_]*)+$/', $class);
@@ -649,7 +655,10 @@ final class Assets
      * Compiles every .php under App/Client/ into the Surface bundle.
      * Only App/Client/Resource/Build/ is excluded (generated output).
      */
-    private function mountVirtualClientFilesMetadata(string $virtualFilesBuffer): mixed
+    /**
+     * @param array<string, string> $buffers
+     */
+    private function mountVirtualClientFilesMetadata(array &$buffers): mixed
     {
         $useViews = Assets\Mesh::isMeshExtension();
 
@@ -664,7 +673,6 @@ final class Assets
 
         if (!is_dir($clientPath)) {
             $data                     = new Arr();
-            $data->virtualFilesBuffer = $virtualFilesBuffer;
             $data->staticConstructors = $staticConstructors;
             $data->events             = $events;
             $data->tags               = $tags;
@@ -716,12 +724,11 @@ final class Assets
                 echo 'Compile client: ' . $class . "\n";
             }
 
-            $phpFile              = $this->loadPhpFile($file);
-            $virtualFilesBuffer .= "'" . sha1($class) . "'=>'" . base64_encode($phpFile) . "',";
+            $phpFile                  = $this->loadPhpFile($file);
+            $buffers[sha1($class)] = $phpFile;
         }
 
         $data                     = new Arr();
-        $data->virtualFilesBuffer = $virtualFilesBuffer;
         $data->staticConstructors = $staticConstructors;
         $data->events             = $events;
         $data->tags               = $tags;
@@ -850,7 +857,7 @@ final class Assets
                     this.shadowRoot.appendChild(Flames.Internal.tags['{$uid}'].template.content.cloneNode(true));
                     var shadowId = Flames.Internal.tags['{$uid}'].shadows.length;
                     Flames.Internal.tags['{$uid}'].shadows[shadowId] = this.shadowRoot;
-                    Flames.Internal.evalBase64(btoa('\\\\Flames\\\\Kernel\\\\Client\\\\Dispatch\\\\Tag::run(\\'{$uid}\\',\\'' + shadowId + '\\');'));
+                    Flames.Internal.evalBase64(btoa('\\\\Flames\\\\Surface\\\\Runtime\\\\Dispatch\\\\Tag::run(\\'{$uid}\\',\\'' + shadowId + '\\');'));
                 }
                 connectedCallback() {
                     var shadowsCount = Flames.Internal.tags['{$uid}'].shadows.length;
@@ -858,7 +865,7 @@ final class Assets
                     for (var i = 0; i < shadowsCount; i++) {
                         if (this.shadowRoot === Flames.Internal.tags['{$uid}'].shadows[i]) { shadowId = i; break; }
                     }
-                    Flames.Internal.evalBase64(btoa('\\\\Flames\\\\Kernel\\\\Client\\\\Dispatch\\\\Tag::render(\\'{$uid}\\',\\'' + shadowId + '\\');'));
+                    Flames.Internal.evalBase64(btoa('\\\\Flames\\\\Surface\\\\Runtime\\\\Dispatch\\\\Tag::render(\\'{$uid}\\',\\'' + shadowId + '\\');'));
                 }
             }
             window.customElements.define('{$uid}', {$clientClassName});
@@ -912,15 +919,20 @@ final class Assets
         }
 
         copy($source, self::PUBLIC_APP_PATH);
+    }
 
-        if ($this->legacyEngine) {
-            file_put_contents(
-                self::PUBLIC_APP_PATH,
-                "\nwindow.Flames.Surface=window.Flames.Surface||{};"
-                . "window.Flames.Surface.onLoad=async function(){if(typeof window.Flames.onReady==='function'){window.Flames.onReady();}};\n",
-                FILE_APPEND
-            );
+    /**
+     * @param array<string, string> $buffers
+     * @param class-string          $class
+     */
+    private function appendOptionalRuntimeClass(array &$buffers, string $class): void
+    {
+        $path = $this->resolveClassFile($class);
+        if ($path === null) {
+            return;
         }
+
+        $buffers[sha1($class)] = $this->loadPhpFile($path);
     }
 
     /** @param resource $stream */
@@ -983,13 +995,7 @@ final class Assets
 
     private function jsEvalBase64(string $encoded): string
     {
-        $call = "Flames.Internal.evalBase64('" . $encoded . "')";
-
-        if ($this->legacyEngine) {
-            return $call . ';';
-        }
-
-        return 'await ' . $call . ';';
+        return 'await Flames.Internal.evalBase64(\'' . $encoded . '\');';
     }
 
     private function verifyAuto(): void
