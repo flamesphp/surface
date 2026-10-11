@@ -13,12 +13,11 @@ use Flames\Client\Event;
 class Data
 {
     private const int VERSION  = 5;
-    private const string CACHE_DIR = ROOT_PATH . '.cache/.flames/client-controller/';
 
     public static function mountData(string $class): Arr
     {
         $path        = ROOT_PATH . str_replace('\\', '/', $class) . '.php';
-        $cachePath   = self::CACHE_DIR . sha1($class);
+        $cachePath   = self::cacheDir() . sha1($class);
         $currentTime = filemtime($path);
 
         if (file_exists($cachePath) && filemtime($cachePath) === $currentTime) {
@@ -32,9 +31,9 @@ class Data
         $written = @file_put_contents($cachePath, serialize($data));
 
         if ($written === false) {
-            if (!is_dir(self::CACHE_DIR)) {
+            if (!is_dir(self::cacheDir())) {
                 $mask = umask(0);
-                mkdir(self::CACHE_DIR, 0777, true);
+                mkdir(self::cacheDir(), 0777, true);
                 umask($mask);
             }
             @file_put_contents($cachePath, serialize($data));
@@ -89,5 +88,10 @@ class Data
         }
 
         return $data;
+    }
+
+    private static function cacheDir(): string
+    {
+        return rtrim(\Flames\Framework\Cache::getPath(), '/') . '/.flames/client-controller/';
     }
 }
